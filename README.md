@@ -1,3 +1,6 @@
+<img width="256" height="256" alt="EglantineUpdater" src="https://github.com/user-attachments/assets/a9a52fb8-8508-4e01-a82a-1053ca42d258" />
+
+
 # Eglantine Updater
 
 A Windows tray app (C#, .NET 8, WinForms) that watches
