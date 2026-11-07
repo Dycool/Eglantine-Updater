@@ -1,135 +1,236 @@
-using System;
-using System.IO;
 using System.IO.Compression;
-using System.Linq;
-using System.Net.Http;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Security.Cryptography;
+using System.Text.Json;
 
 namespace EglantineUpdater.Core;
 
-public readonly record struct InstallProgress(string Stage, int Percent);
-
-/// <summary>Downloads a release zip and unpacks it over the Eglantine folder.</summary>
-public static class Installer
+internal static class Installer
 {
-    public const string EglantineExe = "eglantine.exe";
+    internal const string Emulator = "eglantine.exe";
+    internal const string StateFolder = ".eglantine-launcher";
+    private const string Pending = "pending";
+    private const string Staging = "staging";
+    private const string Finished = "finished";
+    private const string Journal = "journal.json";
+    private sealed record Change(string Path, string StagedPath, bool HadOriginal);
 
-    public static async Task InstallAsync(ReleaseInfo release, string installDir,
-        IProgress<InstallProgress>? progress = null, CancellationToken ct = default)
+    internal static bool HasPendingUpdate(string state) => Directory.Exists(Path.Combine(state, Pending));
+
+    internal static async Task InstallAsync(ReleaseInfo release, string root, string state,
+        IProgress<string> progress, Func<bool> emulatorRunning)
     {
-        var temp = Path.Combine(Path.GetTempPath(), "EglantineUpdater_" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(temp);
+        var staging = Path.Combine(state, Staging);
+        var pending = Path.Combine(state, Pending);
+        EnsurePlainDirectory(staging);
+        var zip = Path.Combine(staging, "update.zip");
         try
         {
-            var zipPath = Path.Combine(temp, "download.zip");
-            await DownloadAsync(release.AssetUrl, zipPath, progress, ct).ConfigureAwait(false);
+            progress.Report($"Downloading {release.Tag}.");
+            await DownloadAsync(release, zip);
+            progress.Report("Verifying SHA-256.");
+            await using (var file = File.OpenRead(zip))
+            {
+                var digest = Convert.ToHexString(await SHA256.HashDataAsync(file));
+                if (digest != release.Digest) throw new InvalidDataException("The update ZIP failed SHA-256 verification.");
+            }
 
-            progress?.Report(new InstallProgress("Extracting", -1));
-            var extractDir = Path.Combine(temp, "extract");
-            await Task.Run(() => ZipFile.ExtractToDirectory(zipPath, extractDir), ct).ConfigureAwait(false);
+            progress.Report("Preparing update.");
+            var extracted = Path.Combine(staging, "extracted");
+            using (var archive = ZipFile.OpenRead(zip))
+            {
+                if (archive.Entries.Count > 50_000 || archive.Entries.Sum(e => (decimal)e.Length) > 8L * 1024 * 1024 * 1024)
+                    throw new InvalidDataException("The update archive is too large to extract.");
+                foreach (var entry in archive.Entries)
+                    ValidateRelativePath(entry.FullName.TrimEnd('/', '\\'));
+                archive.ExtractToDirectory(extracted);
+            }
 
-            var root = FindPayloadRoot(extractDir);
-            progress?.Report(new InstallProgress("Installing", -1));
-            await Task.Run(() => CopyTree(root, installDir, ct), ct).ConfigureAwait(false);
+            var payload = FindPayload(extracted);
+            var paths = Directory.EnumerateFiles(payload, "*", SearchOption.AllDirectories)
+                .Select(file => Path.GetRelativePath(payload, file)).ToArray();
+            foreach (var path in paths) ValidatePayloadPath(path);
+
+            var changes = new List<Change>();
+            var payloadPath = Path.GetRelativePath(staging, payload);
+            foreach (var path in paths)
+                changes.Add(BackUp(root, staging, path, Path.Combine(payloadPath, path)));
+            var identityPath = Path.Combine(StateFolder, "installed");
+            changes.Add(BackUp(root, staging, identityPath, "identity"));
+            File.WriteAllText(Path.Combine(staging, "identity"), release.Identity);
+            using (var journal = new FileStream(Path.Combine(staging, Journal), FileMode.CreateNew, FileAccess.Write))
+            {
+                JsonSerializer.Serialize(journal, changes);
+                journal.Flush(flushToDisk: true);
+            }
+
+            if (emulatorRunning()) throw new IOException("Eglantine is running. Close it to apply the update.");
+            Directory.Move(staging, pending);
+            try
+            {
+                progress.Report("Installing update.");
+                foreach (var change in changes)
+                    ReplaceFile(CheckedPath(pending, change.StagedPath), CheckedPath(root, change.Path));
+                Directory.Move(pending, Path.Combine(state, Finished));
+            }
+            catch
+            {
+                Recover(root, state);
+                throw;
+            }
         }
         finally
         {
-            try { Directory.Delete(temp, recursive: true); } catch { /* best effort */ }
+            TryClean(staging);
+            TryClean(Path.Combine(state, Finished));
         }
     }
 
-    private static async Task DownloadAsync(string url, string target, IProgress<InstallProgress>? progress, CancellationToken ct)
+    internal static void Recover(string root, string state)
     {
-        progress?.Report(new InstallProgress("Downloading", 0));
-        using var response = await GitHubReleases.Http
-            .GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-        response.EnsureSuccessStatusCode();
+        var pending = Path.Combine(state, Pending);
+        var finished = Path.Combine(state, Finished);
+        Clean(Path.Combine(state, Staging));
+        Clean(finished);
+        if (!Directory.Exists(pending)) return;
+        EnsurePlainDirectory(pending);
 
-        var total = response.Content.Headers.ContentLength ?? -1;
-        await using var input = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-        await using var output = File.Create(target);
-
-        var buffer = new byte[256 * 1024];
-        long done = 0;
-        int lastPercent = -1, read;
-        while ((read = await ReadWithIdleTimeoutAsync(input, buffer, ct).ConfigureAwait(false)) > 0)
+        var changes = JsonSerializer.Deserialize<Change[]>(File.ReadAllText(CheckedPath(pending, Journal)))
+            ?? throw new InvalidDataException("The previous update has an unreadable recovery journal.");
+        foreach (var change in changes.Reverse())
         {
-            await output.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
-            done += read;
-            if (total > 0)
+            if (change.Path != Path.Combine(StateFolder, "installed")) ValidatePayloadPath(change.Path);
+            // A staged file disappears only when it has been moved into the install.
+            if (File.Exists(CheckedPath(pending, change.StagedPath))) continue;
+            var target = CheckedPath(root, change.Path);
+            if (change.HadOriginal)
             {
-                var percent = (int)(done * 100 / total);
-                if (percent != lastPercent) { lastPercent = percent; progress?.Report(new InstallProgress("Downloading", percent)); }
+                var backup = CheckedPath(pending, Path.Combine("backup", change.Path));
+                var restore = CheckedPath(pending, "restore.tmp");
+                File.Copy(backup, restore, overwrite: true);
+                ReplaceFile(restore, target);
+            }
+            else
+            {
+                File.Delete(target);
             }
         }
-        if (total > 0 && done != total)
-            throw new IOException($"Download incomplete ({done:N0} of {total:N0} bytes).");
+
+        Directory.Move(pending, finished);
+        TryClean(finished);
     }
 
-    private static async Task<int> ReadWithIdleTimeoutAsync(Stream s, byte[] buffer, CancellationToken ct)
+    private static async Task DownloadAsync(ReleaseInfo release, string target)
     {
-        using var idle = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        idle.CancelAfter(TimeSpan.FromMinutes(2));
-        try
+        using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(10));
+        var ct = timeout.Token;
+        using var response = await GitHubReleases.Http.GetAsync(release.Url, HttpCompletionOption.ResponseHeadersRead, ct);
+        response.EnsureSuccessStatusCode();
+        await using var input = await response.Content.ReadAsStreamAsync(ct);
+        await using var output = File.Create(target);
+        var buffer = new byte[128 * 1024];
+        long total = 0;
+        int read;
+        while ((read = await input.ReadAsync(buffer, ct)) != 0)
         {
-            return await s.ReadAsync(buffer.AsMemory(), idle.Token).ConfigureAwait(false);
+            total += read;
+            if (total > release.Size) throw new InvalidDataException("The update exceeds the published asset size.");
+            await output.WriteAsync(buffer.AsMemory(0, read), ct);
         }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        if (total != release.Size) throw new InvalidDataException("The update ZIP is incomplete.");
+    }
+
+    private static string FindPayload(string extracted)
+    {
+        if (File.Exists(Path.Combine(extracted, Emulator))) return extracted;
+        var folders = Directory.GetDirectories(extracted);
+        if (folders.Length == 1 && File.Exists(Path.Combine(folders[0], Emulator))) return folders[0];
+        throw new InvalidDataException($"The update ZIP does not contain {Emulator} in the expected location.");
+    }
+
+    private static Change BackUp(string root, string staging, string relativePath, string stagedPath)
+    {
+        var original = CheckedPath(root, relativePath);
+        if (Directory.Exists(original))
+            throw new IOException($"A directory conflicts with the update file {relativePath}.");
+
+        var exists = File.Exists(original);
+        if (exists)
         {
-            throw new TimeoutException("The download stalled for 2 minutes.");
+            var backup = Path.Combine(staging, "backup", relativePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
+            File.Copy(original, backup);
+        }
+        return new Change(relativePath, stagedPath, exists);
+    }
+
+    private static void ReplaceFile(string source, string target)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+        File.Move(source, target, overwrite: true);
+    }
+
+    private static void ValidatePayloadPath(string path)
+    {
+        ValidateRelativePath(path);
+        var top = path.Split('/', '\\')[0];
+        if (top.Equals(StateFolder, StringComparison.OrdinalIgnoreCase)
+            || top.Equals("user", StringComparison.OrdinalIgnoreCase)
+            || top.StartsWith("EglantineLauncher", StringComparison.OrdinalIgnoreCase)
+            || top.Equals("EglantineUpdater.exe", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException($"The update contains a reserved path: {path}");
+    }
+
+    private static void ValidateRelativePath(string path)
+    {
+        foreach (var part in path.Split('/', '\\'))
+        {
+            var stem = part.Split('.')[0];
+            if (part.Length == 0 || part.EndsWith('.') || part.EndsWith(' ')
+                || part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
+                || System.Text.RegularExpressions.Regex.IsMatch(stem,
+                    @"\A(?:CON|PRN|AUX|NUL|COM[0-9���]|LPT[0-9���])\z", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                throw new InvalidDataException($"The update contains an invalid Windows path: {path}");
         }
     }
 
-    /// <summary>
-    /// The folder whose contents should land in the install folder: unwraps a single
-    /// top-level folder, or uses wherever eglantine.exe is inside the archive.
-    /// </summary>
-    public static string FindPayloadRoot(string extractDir)
+    internal static string CheckedPath(string root, string path)
     {
-        var root = extractDir;
-        var entries = Directory.GetFileSystemEntries(extractDir);
-        if (entries.Length == 1 && Directory.Exists(entries[0])) root = entries[0];
-
-        if (!File.Exists(Path.Combine(root, EglantineExe)))
+        ValidateRelativePath(path);
+        foreach (var part in path.Split('/', '\\'))
         {
-            var exe = Directory.EnumerateFiles(extractDir, EglantineExe, SearchOption.AllDirectories)
-                .OrderBy(p => p.Length)
-                .FirstOrDefault();
-            if (exe is not null) root = Path.GetDirectoryName(exe)!;
+            root = Path.Combine(root, part);
+            RejectReparsePoint(root);
         }
         return root;
     }
 
-    /// <summary>Copies everything from <paramref name="source"/> over <paramref name="dest"/>, overwriting files and keeping extras.</summary>
-    public static void CopyTree(string source, string dest, CancellationToken ct = default)
+    internal static void EnsurePlainDirectory(string path)
     {
-        Directory.CreateDirectory(dest);
-        foreach (var dir in Directory.EnumerateDirectories(source, "*", SearchOption.AllDirectories))
-            Directory.CreateDirectory(Path.Combine(dest, Path.GetRelativePath(source, dir)));
+        RejectReparsePoint(path);
+        Directory.CreateDirectory(path);
+    }
 
-        foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
+    private static void RejectReparsePoint(string path)
+    {
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            var target = Path.Combine(dest, Path.GetRelativePath(source, file));
-            for (var attempt = 1; ; attempt++)
-            {
-                try
-                {
-                    if (File.Exists(target)) File.SetAttributes(target, FileAttributes.Normal);
-                    File.Copy(file, target, overwrite: true);
-                    break;
-                }
-                catch (IOException) when (attempt < 5)
-                {
-                    Thread.Sleep(1000); // file briefly locked (antivirus, process still exiting)
-                }
-                catch (UnauthorizedAccessException ex)
-                {
-                    throw new UnauthorizedAccessException(
-                        $"Cannot write {target}. If Eglantine is in Program Files, move it to a folder you own.", ex);
-                }
-            }
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                throw new IOException($"Updates cannot traverse a link or junction: {path}");
         }
+        catch (FileNotFoundException) { }
+        catch (DirectoryNotFoundException) { }
+    }
+
+    private static void Clean(string path)
+    {
+        RejectReparsePoint(path);
+        if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+    }
+
+    private static void TryClean(string path)
+    {
+        try { Clean(path); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 }
