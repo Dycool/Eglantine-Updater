@@ -188,7 +188,7 @@ internal static class Installer
             if (part.Length == 0 || part.EndsWith('.') || part.EndsWith(' ')
                 || part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
                 || System.Text.RegularExpressions.Regex.IsMatch(stem,
-                    @"\A(?:CON|PRN|AUX|NUL|COM[0-9���]|LPT[0-9���])\z", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                    @"\A(?:CON|PRN|AUX|NUL|COM[0-9\u00B9\u00B2\u00B3]|LPT[0-9\u00B9\u00B2\u00B3])\z", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
                 throw new InvalidDataException($"The update contains an invalid Windows path: {path}");
         }
     }
