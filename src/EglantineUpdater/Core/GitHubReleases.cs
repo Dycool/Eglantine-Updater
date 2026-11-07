@@ -1,98 +1,62 @@
-using System;
-using System.IO;
-using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace EglantineUpdater.Core;
 
-public sealed record ReleaseInfo(
-    string Tag,
-    string Name,
-    string Url,
-    bool Prerelease,
-    DateTimeOffset Published,
-    string AssetName,
-    string AssetUrl,
-    long AssetSize);
-
-/// <summary>Reads the Eglantine release list from the GitHub API.</summary>
-public static class GitHubReleases
+internal sealed record ReleaseInfo(string Tag, Uri Url, long Size, string Digest)
 {
-    public const string Repo = "Djihads80/Eglantine";
-    public const string ReleasesPage = "https://github.com/" + Repo + "/releases";
-    public const string ApiUrl = "https://api.github.com/repos/" + Repo + "/releases?per_page=30";
+    public string Identity => Tag + "\n" + Digest;
+}
 
-    public static HttpClient Http { get; } = CreateClient();
+internal static class GitHubReleases
+{
+    private const string Repo = "Djihads80/Eglantine";
+    private static readonly Regex AssetPattern = new(@"^eglantine-windows-x86_64-pgo.*\.zip$",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    internal static readonly HttpClient Http = new() { Timeout = Timeout.InfiniteTimeSpan };
 
-    private static HttpClient CreateClient()
+    static GitHubReleases()
     {
-        var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan }; // per-request timeouts instead
-        client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("EglantineUpdater", "1.0"));
-        return client;
+        Http.DefaultRequestHeaders.UserAgent.ParseAdd("EglantineLauncher/1.0");
     }
 
-    /// <summary>
-    /// Returns the most recently published (non-draft) release, pre-releases included,
-    /// that has an asset whose name matches <paramref name="assetPattern"/>; null if none.
-    /// </summary>
-    public static async Task<ReleaseInfo?> GetLatestAsync(string assetPattern, CancellationToken ct = default)
+    internal static async Task<ReleaseInfo> GetLatestAsync()
     {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(TimeSpan.FromSeconds(30));
-
-        using var request = new HttpRequestMessage(HttpMethod.Get, ApiUrl);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var request = new HttpRequestMessage(HttpMethod.Get,
+            $"https://api.github.com/repos/{Repo}/releases?per_page=30");
         request.Headers.Accept.ParseAdd("application/vnd.github+json");
-        using var response = await Http.SendAsync(request, timeout.Token).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
+        using var response = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+        response.EnsureSuccessStatusCode();
+        using var body = await response.Content.ReadAsStreamAsync(timeout.Token);
+        using var json = await JsonDocument.ParseAsync(body, cancellationToken: timeout.Token);
+
+        foreach (var release in json.RootElement.EnumerateArray()
+            .Where(r => !r.GetProperty("draft").GetBoolean() && r.GetProperty("published_at").ValueKind == JsonValueKind.String)
+            .OrderByDescending(r => r.GetProperty("published_at").GetDateTimeOffset()))
         {
-            var hint = (int)response.StatusCode == 403 ? " (GitHub rate limit; it will retry later)" : "";
-            throw new HttpRequestException($"GitHub returned {(int)response.StatusCode} {response.ReasonPhrase}{hint}");
-        }
-
-        await using var stream = await response.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
-        return await ParseAsync(stream, assetPattern, timeout.Token).ConfigureAwait(false);
-    }
-
-    public static async Task<ReleaseInfo?> ParseAsync(Stream json, string assetPattern, CancellationToken ct = default)
-    {
-        using var doc = await JsonDocument.ParseAsync(json, cancellationToken: ct).ConfigureAwait(false);
-        var regex = new Regex(assetPattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-        ReleaseInfo? best = null;
-
-        foreach (var r in doc.RootElement.EnumerateArray())
-        {
-            if (r.TryGetProperty("draft", out var draft) && draft.ValueKind == JsonValueKind.True) continue;
-            if (!r.TryGetProperty("published_at", out var pub) || pub.ValueKind != JsonValueKind.String) continue;
-            if (!r.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array) continue;
-
-            var published = pub.GetDateTimeOffset();
-            if (best is not null && published <= best.Published) continue;
-
-            foreach (var a in assets.EnumerateArray())
+            foreach (var asset in release.GetProperty("assets").EnumerateArray())
             {
-                var name = a.GetProperty("name").GetString() ?? "";
-                if (!regex.IsMatch(name)) continue;
+                if (!AssetPattern.IsMatch(asset.GetProperty("name").GetString() ?? "")) continue;
 
-                var tag = r.GetProperty("tag_name").GetString() ?? "";
-                var title = r.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(n.GetString())
-                    ? n.GetString()!
-                    : tag;
-                best = new ReleaseInfo(
-                    tag,
-                    title,
-                    r.GetProperty("html_url").GetString() ?? ReleasesPage,
-                    r.TryGetProperty("prerelease", out var pre) && pre.ValueKind == JsonValueKind.True,
-                    published,
-                    name,
-                    a.GetProperty("browser_download_url").GetString() ?? "",
-                    a.TryGetProperty("size", out var size) && size.ValueKind == JsonValueKind.Number ? size.GetInt64() : -1);
-                break;
+                var digest = asset.TryGetProperty("digest", out var hash) ? hash.GetString() : null;
+                if (digest is null || !Regex.IsMatch(digest, @"\Asha256:[a-fA-F0-9]{64}\z"))
+                    throw new InvalidDataException("GitHub did not provide a SHA-256 checksum for the latest build.");
+
+                if (!Uri.TryCreate(asset.GetProperty("browser_download_url").GetString(), UriKind.Absolute, out var url)
+                    || url.Scheme != Uri.UriSchemeHttps || url.Host != "github.com" || !url.IsDefaultPort
+                    || url.UserInfo.Length != 0
+                    || !url.AbsolutePath.StartsWith($"/{Repo}/releases/download/", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("The release points outside the expected GitHub downloads.");
+
+                var size = asset.GetProperty("size").GetInt64();
+                if (size is <= 0 or > 2L * 1024 * 1024 * 1024)
+                    throw new InvalidDataException("Unexpected update download size.");
+
+                return new ReleaseInfo(release.GetProperty("tag_name").GetString()!, url, size,
+                    digest[7..].ToUpperInvariant());
             }
         }
-        return best;
+        throw new InvalidDataException("No matching Windows x64 PGO release was found.");
     }
 }
